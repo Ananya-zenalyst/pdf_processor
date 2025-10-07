@@ -1,0 +1,7 @@
+PyMuPDF
+pdfplumber
+pytesseract
+Pillow
+fastapi
+uvicorn[standard]
+python-multipart
