@@ -16,12 +16,12 @@ import io
 
 class VisualTableExtractor:
     """
-    Advanced table extractor that uses computer vision to understand table structure
-    and compares multiple extraction methods to provide the best results.
+    Table extractor that uses computer vision to understand table structure
+    and Camelot for extraction to provide accurate results.
     """
 
     def __init__(self):
-        self.extraction_methods = ['camelot', 'tabula', 'pdfplumber']
+        self.extraction_method = 'camelot'
         self.temp_files = []
 
     def __del__(self):
@@ -80,8 +80,8 @@ class VisualTableExtractor:
         # Find table contours
         contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Filter contours by area to find actual tables
-        min_table_area = image.shape[0] * image.shape[1] * 0.01  # At least 1% of page
+        # Filter contours by area to find actual tables - reduced threshold to catch more tables
+        min_table_area = image.shape[0] * image.shape[1] * 0.001  # At least 0.1% of page (10x more sensitive)
         table_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > min_table_area]
 
         # Get table bounding boxes
@@ -176,8 +176,9 @@ class VisualTableExtractor:
                         non_empty_cells = df.notna().sum().sum()
                         print(f"        Non-empty cells: {non_empty_cells}/{df.shape[0] * df.shape[1]}")
 
-                        # Skip tables with very few cells
-                        if non_empty_cells > 0:
+                        # Include tables with any meaningful content (more inclusive)
+                        total_cells = df.shape[0] * df.shape[1]
+                        if non_empty_cells > 0 or total_cells >= 4:  # Accept if has content OR is reasonably sized
                             tables.append({
                                 'method': f'tabula_{config_name}',
                                 'table_index': i,
@@ -354,6 +355,81 @@ class VisualTableExtractor:
 
         return min(final_score, 1.0)
 
+    def _identify_unique_tables(self, all_extractions: List[Dict]) -> List[Dict]:
+        """
+        Identify unique tables from all extractions and select the best extraction for each.
+        Groups similar tables together and returns the best extraction for each unique table.
+
+        Returns:
+            List of best extractions for each unique table found in the PDF
+        """
+        if not all_extractions:
+            return []
+
+        # Group tables by their dimensions and content similarity
+        table_groups = []
+
+        for extraction in all_extractions:
+            df = extraction['dataframe']
+
+            # Skip empty dataframes
+            if df.empty:
+                continue
+
+            # Create a signature for the table based on dimensions and content
+            signature = {
+                'rows': df.shape[0],
+                'cols': df.shape[1],
+                'first_row': tuple(df.iloc[0].fillna('').astype(str)) if len(df) > 0 else (),
+                'last_row': tuple(df.iloc[-1].fillna('').astype(str)) if len(df) > 0 else (),
+                'total_non_empty': df.notna().sum().sum()
+            }
+
+            # Check if this table belongs to an existing group
+            found_group = False
+            for group in table_groups:
+                # Compare with the first table in the group
+                group_sig = group['signature']
+
+                # Tables are considered the same if they have similar dimensions and content
+                same_dimensions = (abs(signature['rows'] - group_sig['rows']) <= 2 and
+                                 abs(signature['cols'] - group_sig['cols']) <= 1)
+
+                # Check content similarity (at least 70% similarity in first/last rows)
+                content_similar = False
+                if same_dimensions and signature['first_row'] and group_sig['first_row']:
+                    # Compare first rows
+                    if len(signature['first_row']) == len(group_sig['first_row']):
+                        matches = sum(1 for a, b in zip(signature['first_row'], group_sig['first_row'])
+                                    if a == b or (a == '' and b == '') or (a != '' and b != ''))
+                        content_similar = matches / len(signature['first_row']) >= 0.7
+
+                if same_dimensions and content_similar:
+                    # Add to existing group
+                    group['extractions'].append(extraction)
+                    found_group = True
+                    break
+
+            if not found_group:
+                # Create a new group
+                table_groups.append({
+                    'signature': signature,
+                    'extractions': [extraction]
+                })
+
+        # Select the best extraction from each group
+        unique_tables = []
+        for group in table_groups:
+            # Sort by quality score and select the best
+            group['extractions'].sort(key=lambda x: x['quality_score'], reverse=True)
+            best_extraction = group['extractions'][0]
+            unique_tables.append(best_extraction)
+
+        # Sort unique tables by their appearance order or quality
+        unique_tables.sort(key=lambda x: x.get('table_index', 0))
+
+        return unique_tables
+
     def sanitize_for_json(self, value):
         """Ensure JSON compliance"""
         if pd.isna(value) or value is None:
@@ -391,9 +467,8 @@ class VisualTableExtractor:
         # Create Excel-ready structure
         excel_format = {
             "table_metadata": {
-                "extraction_method": table_metadata.get('method', 'unknown'),
+                "extraction_method": table_metadata.get('method', 'camelot'),
                 "table_index": table_metadata.get('table_index', 0),
-                "quality_score": table_metadata.get('quality_score', 0),
                 "dimensions": {
                     "rows": len(data_rows),
                     "columns": len(headers)
@@ -793,18 +868,8 @@ class VisualTableExtractor:
                 sheet_name = f"Table_{table_idx + 1}"
                 ws = wb.create_sheet(sheet_name)
 
-                # Add metadata
-                metadata = table_data.get("table_metadata", {})
-                ws["A1"] = f"Extraction Method: {metadata.get('extraction_method', 'unknown')}"
-                ws["A2"] = f"Quality Score: {metadata.get('quality_score', 0):.3f}"
-                ws["A3"] = f"Dimensions: {metadata.get('dimensions', {}).get('rows', 0)}x{metadata.get('dimensions', {}).get('columns', 0)}"
-
-                # Style metadata
-                for row in range(1, 4):
-                    ws[f"A{row}"].font = Font(bold=True, italic=True)
-
-                # Start table data at row 5
-                start_row = 5
+                # Start table data at row 1 (no metadata)
+                start_row = 1
 
                 # Add headers
                 headers = table_data.get("headers", [])
@@ -856,38 +921,15 @@ class VisualTableExtractor:
                     adjusted_width = min(max_length + 2, 50)  # Cap at 50 characters
                     ws.column_dimensions[column_letter].width = adjusted_width
 
-        # Add summary sheet
-        summary_ws = wb.create_sheet("Extraction Summary", 0)
-
-        # Add summary data
+        # Optional: Add a simple summary sheet with just the table count
+        # Comment out this entire block if you don't want any summary sheet
+        summary_ws = wb.create_sheet("Summary", 0)
         summary = data.get("extraction_summary", {})
-        summary_ws["A1"] = "PDF Table Extraction Summary"
-        summary_ws["A1"].font = Font(size=16, bold=True)
-
-        summary_ws["A3"] = "Total Extractions:"
-        summary_ws["B3"] = summary.get("total_extractions", 0)
-        summary_ws["A4"] = "Best Method:"
-        summary_ws["B4"] = summary.get("best_method", "unknown")
-        summary_ws["A5"] = "Best Quality Score:"
-        summary_ws["B5"] = f"{summary.get('best_quality_score', 0):.3f}"
-
-        # Visual analysis
-        visual_analysis = summary.get("visual_analysis", {})
-        summary_ws["A7"] = "Visual Analysis:"
-        summary_ws["A8"] = "  Table Count:"
-        summary_ws["B8"] = visual_analysis.get("table_count", 0)
-        summary_ws["A9"] = "  Has Borders:"
-        summary_ws["B9"] = "Yes" if visual_analysis.get("has_borders", False) else "No"
-        summary_ws["A10"] = "  Line Density:"
-        summary_ws["B10"] = f"{visual_analysis.get('line_density', 0):.4f}"
-
-        # Style summary
-        for row in range(1, 11):
-            summary_ws[f"A{row}"].font = Font(bold=True)
-
-        # Auto-adjust summary sheet columns
-        summary_ws.column_dimensions["A"].width = 25
-        summary_ws.column_dimensions["B"].width = 20
+        summary_ws["A1"] = "Total Tables Extracted:"
+        summary_ws["B1"] = summary.get("total_tables", len(tables))
+        summary_ws["A1"].font = Font(bold=True)
+        summary_ws.column_dimensions["A"].width = 20
+        summary_ws.column_dimensions["B"].width = 10
 
         # Save or return bytes
         if output_path:
@@ -900,13 +942,20 @@ class VisualTableExtractor:
             excel_bytes.seek(0)
             return excel_bytes.getvalue()
 
-    def extract_tables(self, pdf_path: str) -> str:
+    def extract_tables(self, pdf_path: str, extract_all_unique: bool = True) -> str:
         """
         Main extraction method that:
         1. Analyzes PDF visually
-        2. Extracts with multiple methods
-        3. Compares results
-        4. Returns best result in Excel-ready format
+        2. Extracts with Camelot only
+        3. Returns all tables in Excel-ready format
+
+        Args:
+            pdf_path: Path to the PDF file
+            extract_all_unique: If True, extracts ALL tables from PDF (default: True)
+                               If False, limits to first 3 tables
+
+        Returns:
+            JSON string with all extracted tables and metadata
         """
         debug_info = {
             "pdf_path": pdf_path,
@@ -915,14 +964,21 @@ class VisualTableExtractor:
         }
 
         try:
-            # Step 1: Visual analysis of first page
+            # Step 1: Visual analysis of all pages for comprehensive structure detection
             print(f"🔍 Starting visual analysis of PDF: {pdf_path}")
             debug_info["extraction_steps"].append("visual_analysis_started")
 
+            # Analyze first page for structure, but also check total page count
+            doc = fitz.open(pdf_path)
+            total_pages = len(doc)
+            doc.close()
+
             image = self.pdf_page_to_image(pdf_path, 0)
             structure_info = self.detect_table_structure(image)
+            structure_info['total_pages'] = total_pages
 
             print(f"📊 Visual analysis results:")
+            print(f"  - Total pages: {total_pages}")
             print(f"  - Table count: {structure_info.get('table_count', 0)}")
             print(f"  - Has borders: {structure_info.get('has_borders', False)}")
             print(f"  - Line density: {structure_info.get('line_density', 0):.4f}")
@@ -930,11 +986,11 @@ class VisualTableExtractor:
             debug_info["visual_analysis"] = structure_info
             debug_info["extraction_steps"].append("visual_analysis_completed")
 
-            # Step 2: Extract with all methods
+            # Step 2: Extract with Camelot only
             all_extractions = []
-            print(f"\n🛠️ Starting extraction with multiple methods...")
+            print(f"\n🛠️ Starting extraction with Camelot...")
 
-            # Camelot
+            # Camelot extraction
             print("📋 Trying Camelot extraction...")
             debug_info["extraction_steps"].append("camelot_started")
             camelot_results = self.extract_with_camelot(pdf_path, structure_info)
@@ -942,28 +998,12 @@ class VisualTableExtractor:
             print(f"  Camelot found {len(camelot_results)} tables")
             all_extractions.extend(camelot_results)
 
-            # Tabula
-            print("📊 Trying Tabula extraction...")
-            debug_info["extraction_steps"].append("tabula_started")
-            tabula_results = self.extract_with_tabula(pdf_path, structure_info)
-            debug_info["method_results"]["tabula"] = {"count": len(tabula_results), "success": len(tabula_results) > 0}
-            print(f"  Tabula found {len(tabula_results)} tables")
-            all_extractions.extend(tabula_results)
-
-            # PDFplumber
-            print("📄 Trying PDFplumber extraction...")
-            debug_info["extraction_steps"].append("pdfplumber_started")
-            plumber_results = self.extract_with_pdfplumber(pdf_path, structure_info)
-            debug_info["method_results"]["pdfplumber"] = {"count": len(plumber_results), "success": len(plumber_results) > 0}
-            print(f"  PDFplumber found {len(plumber_results)} tables")
-            all_extractions.extend(plumber_results)
-
-            print(f"\n📈 Total extractions found: {len(all_extractions)}")
+            print(f"\n📈 Total tables found: {len(all_extractions)}")
             debug_info["total_extractions"] = len(all_extractions)
 
             if not all_extractions:
                 error_result = {
-                    "error": "No tables found with any method",
+                    "error": "No tables found with Camelot",
                     "debug_info": debug_info,
                     "visual_analysis": structure_info,
                     "troubleshooting": {
@@ -974,44 +1014,36 @@ class VisualTableExtractor:
                         ]
                     }
                 }
-                print("❌ No tables found with any extraction method")
+                print("❌ No tables found with Camelot extraction")
                 return json.dumps(error_result, indent=2)
 
-            # Step 3: Score and rank extractions
-            print(f"\n⚖️ Scoring table quality...")
-            debug_info["extraction_steps"].append("scoring_started")
+            # Step 3: Process extracted tables
+            print(f"\n📋 Processing {len(all_extractions)} tables...")
+            debug_info["extraction_steps"].append("processing_started")
 
+            # Add table info for debugging
             for i, extraction in enumerate(all_extractions):
-                score = self.score_table_quality(extraction)
-                extraction['quality_score'] = score
-                print(f"  Table {i+1} ({extraction['method']}): Score {score:.3f}")
-
-                # Add shape info for debugging
                 df = extraction['dataframe']
-                print(f"    Shape: {df.shape[0]}x{df.shape[1]}")
+                print(f"  Table {i+1}: Shape {df.shape[0]}x{df.shape[1]}")
                 print(f"    Non-empty cells: {df.notna().sum().sum()}/{df.shape[0] * df.shape[1]}")
-
-            # Sort by quality score
-            all_extractions.sort(key=lambda x: x['quality_score'], reverse=True)
-            debug_info["extraction_steps"].append("scoring_completed")
-
-            # Step 4: Create output with best results
-            print(f"\n🏆 Best extraction: {all_extractions[0]['method']} (score: {all_extractions[0]['quality_score']:.3f})")
 
             output = {
                 "extraction_summary": {
-                    "total_extractions": len(all_extractions),
-                    "best_method": all_extractions[0]['method'],
-                    "best_quality_score": all_extractions[0]['quality_score'],
+                    "total_tables": len(all_extractions),
+                    "extraction_method": "camelot",
                     "visual_analysis": structure_info,
                     "debug_info": debug_info
                 },
                 "tables": []
             }
 
-            # Include top 3 results or all if less than 3
-            top_results = all_extractions[:min(3, len(all_extractions))]
-            print(f"📋 Including top {len(top_results)} results in output")
+            # Include all tables or limit based on parameter
+            if extract_all_unique:
+                top_results = all_extractions  # Take all tables
+                print(f"📋 Including all {len(top_results)} tables in output")
+            else:
+                top_results = all_extractions[:min(3, len(all_extractions))]  # Limit to 3
+                print(f"📋 Including first {len(top_results)} tables in output")
 
             for extraction in top_results:
                 excel_ready_table = self.create_excel_ready_format(
@@ -1038,15 +1070,22 @@ class VisualTableExtractor:
 
 # Legacy function for backward compatibility
 def extract_tables(pdf_path: str) -> str:
-    """Backward compatible function"""
+    """Backward compatible function - extracts ALL tables using Camelot"""
     extractor = VisualTableExtractor()
-    return extractor.extract_tables(pdf_path)
+    return extractor.extract_tables(pdf_path, extract_all_unique=True)
 
 # New recommended function
-def extract_tables_with_cv(pdf_path: str) -> str:
-    """Main function using computer vision enhanced extraction"""
+def extract_tables_with_cv(pdf_path: str, extract_all_unique: bool = True) -> str:
+    """
+    Main function using computer vision enhanced extraction with Camelot
+
+    Args:
+        pdf_path: Path to PDF file
+        extract_all_unique: If True, extracts ALL tables from PDF (default: True)
+                           If False, limits to first 3 tables
+    """
     extractor = VisualTableExtractor()
-    return extractor.extract_tables(pdf_path)
+    return extractor.extract_tables(pdf_path, extract_all_unique=extract_all_unique)
 
 # Excel conversion functions
 def convert_table_json_to_excel(table_json: Union[str, Dict], output_path: str = None) -> Union[str, bytes]:
@@ -1071,27 +1110,31 @@ def convert_table_json_to_excel(table_json: Union[str, Dict], output_path: str =
     extractor = VisualTableExtractor()
     return extractor.convert_to_excel(table_json, output_path)
 
-def extract_tables_to_excel(pdf_path: str, excel_output_path: str = None) -> Union[str, bytes]:
+def extract_tables_to_excel(pdf_path: str, excel_output_path: str = None, extract_all_unique: bool = True) -> Union[str, bytes]:
     """
-    Extract tables from PDF and directly convert to Excel
+    Extract tables from PDF using Camelot and directly convert to Excel
 
     Args:
         pdf_path: Path to PDF file
         excel_output_path: Optional path to save Excel file. If None, returns bytes
+        extract_all_unique: If True, extracts ALL tables from PDF (default: True)
 
     Returns:
         str: Excel file path if excel_output_path provided, otherwise bytes
 
     Example:
-        # Extract PDF to Excel file
+        # Extract ALL tables from PDF to Excel file
         excel_path = extract_tables_to_excel('document.pdf', 'tables.xlsx')
 
-        # Extract PDF to Excel bytes for download
+        # Extract ALL tables from PDF to Excel bytes for download
         excel_bytes = extract_tables_to_excel('document.pdf')
+
+        # Extract first 3 tables only
+        excel_bytes = extract_tables_to_excel('document.pdf', extract_all_unique=False)
     """
-    # Extract tables using CV-enhanced method
+    # Extract tables using Camelot
     extractor = VisualTableExtractor()
-    json_result = extractor.extract_tables(pdf_path)
+    json_result = extractor.extract_tables(pdf_path, extract_all_unique=extract_all_unique)
 
     # Convert to Excel
     return extractor.convert_to_excel(json_result, excel_output_path)
@@ -1414,7 +1457,7 @@ def extract_tables_with_position(pdf_path: str) -> Dict:
         sys.stdout = StringIO()
 
         try:
-            result_json = extractor.extract_tables(pdf_path)
+            result_json = extractor.extract_tables(pdf_path, extract_all_unique=True)
         finally:
             sys.stdout = old_stdout
 
