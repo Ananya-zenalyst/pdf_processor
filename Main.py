@@ -1,70 +1,135 @@
 import sys
-import json
-import pdfplumber
 import os
+import json
+from extractors.text_extractor import extract_text_with_position
+from extractors.table_extractor import extract_tables_with_position
+from extractors.image_extractor import extract_images_with_ocr_and_position
+import fitz  # PyMuPDF
 
-# Allow Python to find our extractor modules
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from extractors.text_extractor import extract_text
-from extractors.table_extractor import extract_tables
-from extractors.image_extractor import extract_images_and_ocr
-
-def analyze_and_extract(pdf_path):
+def _is_bbox_inside(inner_bbox, outer_bbox, tolerance=1.0):
     """
-    Analyzes a PDF to decide which content types are present and
-    routes them to the appropriate extractors.
-
-    Args:
-        pdf_path (str): The path to the PDF file.
-
-    Returns:
-        str: A JSON string with all extracted content.
+    Checks if the inner_bbox is located inside the outer_bbox.
+    A small tolerance is added to handle minor detection discrepancies.
     """
-    final_extraction = {}
-    has_text, has_tables, has_images = False, False, False
+    i_x0, i_top, i_x1, i_bottom = inner_bbox
+    o_x0, o_top, o_x1, o_bottom = outer_bbox
+    
+    return (i_x0 >= o_x0 - tolerance and
+            i_top >= o_top - tolerance and
+            i_x1 <= o_x1 + tolerance and
+            i_bottom <= o_bottom + tolerance)
 
-    # 1. Analyze the PDF to determine which extractors to run
+def get_document_layout(pdf_path):
+    """
+    Analyzes the PDF to extract all content, de-duplicates text found within
+    tables and charts, sorts the final content by visual order, and formats
+    the output with page and element numbers as requested.
+    """
+    final_output = {}
+
+    print("Step 1: Extracting tables...")
+    table_content_by_page = extract_tables_with_position(pdf_path)
+    
+    print("Step 2: Extracting images and charts...")
+    image_content_by_page = extract_images_with_ocr_and_position(pdf_path)
+    
+    print("Step 3: Extracting and filtering text blocks...")
+    text_content_by_page = extract_text_with_position(pdf_path)
+
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                if page.extract_text(x_tolerance=2).strip(): has_text = True
-                if page.find_tables(): has_tables = True
-                if page.images: has_images = True
-                if has_text and has_tables and has_images: break
+        with fitz.open(pdf_path) as pdf_doc:
+            num_pages = len(pdf_doc)
     except Exception as e:
-        return json.dumps({"error": f"Failed to analyze PDF: {e}"}, indent=4)
+        return {"error": f"Could not open PDF to get page count: {e}"}
 
-    print("PDF Analysis Complete:")
-    print(f"- Contains Text: {has_text}, Contains Tables: {has_tables}, Contains Images: {has_images}")
-    print("-" * 20)
+    # Process each page to assemble, filter, sort, and number the content
+    for i in range(num_pages):
+        page_number = i + 1
+        page_key = f"page_{page_number}"
+        
+        page_elements = []
+        
+        # Get all structured elements for the current page
+        tables_on_page = table_content_by_page.get(page_key, [])
+        images_on_page = image_content_by_page.get(page_key, [])
+        text_on_page = text_content_by_page.get(page_key, [])
+        
+        page_elements.extend(tables_on_page)
+        page_elements.extend(images_on_page)
+        
+        # --- Critical De-duplication Step ---
+        # Filter out any raw text blocks that are already contained within a table or chart
+        for text_block in text_on_page:
+            is_redundant = False
+            # Check if text is inside any table's bounding box
+            for table in tables_on_page:
+                if _is_bbox_inside(text_block['bbox'], table['bbox']):
+                    is_redundant = True
+                    break
+            if is_redundant:
+                continue
+            
+            # Check if text is inside any image/chart's bounding box
+            for image in images_on_page:
+                if _is_bbox_inside(text_block['bbox'], image['bbox']):
+                    is_redundant = True
+                    break
+            if is_redundant:
+                continue
+            
+            # If the text is not redundant, add it to our list of elements
+            page_elements.append(text_block)
 
-    # 2. Route to extractors based on the analysis
-    if has_text:
-        text_data = json.loads(extract_text(pdf_path))
-        if text_data: final_extraction["text_content"] = text_data
+        # Sort all unique elements by their position (top-to-bottom, then left-to-right)
+        page_elements.sort(key=lambda x: (x['bbox'][1], x['bbox'][0]))
+        
+        # --- Final Numbering and Formatting ---
+        page_output = []
+        para_counter = 1
+        table_counter = 1
+        image_counter = 1
 
-    if has_tables:
-        table_data = json.loads(extract_tables(pdf_path))
-        if table_data: final_extraction["table_content"] = table_data
+        for element in page_elements:
+            element_type = element.get("type")
+            
+            # Create a clean copy of the element, removing the internal bbox
+            clean_element = element.copy()
+            del clean_element['bbox']
 
-    if has_images:
-        image_data = json.loads(extract_images_and_ocr(pdf_path))
-        if image_data: final_extraction["image_content"] = image_data
+            if element_type == "text":
+                clean_element['page_number'] = page_number
+                clean_element['paragraph_number'] = para_counter
+                para_counter += 1
+            elif element_type == "table":
+                clean_element['page_number'] = page_number
+                clean_element['table_number'] = table_counter
+                table_counter += 1
+            elif element_type == "image":
+                clean_element['page_number'] = page_number
+                clean_element['image_number'] = image_counter
+                image_counter += 1
+            
+            page_output.append(clean_element)
 
-    return json.dumps(final_extraction, indent=4, ensure_ascii=False)
+        final_output[page_key] = page_output
+
+    return final_output
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python main.py <path_to_pdf_file>")
-        sys.exit(1)
-    
-    pdf_file_path = sys.argv[1]
-    if not os.path.exists(pdf_file_path):
-        print(f"Error: File not found at '{pdf_file_path}'")
+        print("Usage: python main.py <path_to_pdf>")
         sys.exit(1)
 
-    extracted_json = analyze_and_extract(pdf_file_path)
-    print("\n--- FINAL EXTRACTED JSON ---")
-    print(extracted_json)
+    pdf_file_path = sys.argv[1]
+    
+    if not os.path.exists(pdf_file_path):
+        print(f"Error: PDF file not found at {pdf_file_path}")
+        sys.exit(1)
+
+    print(f"Analyzing PDF: {pdf_file_path}")
+    
+    structured_content = get_document_layout(pdf_file_path)
+
+    print("\n--- FINAL EXTRACTED JSON (Spatially Ordered, De-duplicated, and Numbered) ---")
+    print(json.dumps(structured_content, indent=2, ensure_ascii=False))
 
