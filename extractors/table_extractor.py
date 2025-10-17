@@ -35,20 +35,28 @@ class VisualTableExtractor:
 
     def pdf_page_to_image(self, pdf_path: str, page_num: int = 0) -> np.ndarray:
         """Convert PDF page to OpenCV image for visual analysis"""
-        doc = fitz.open(pdf_path)
-        page = doc[page_num]
+        try:
+            doc = fitz.open(pdf_path)
+            if page_num >= len(doc):
+                page_num = 0  # Default to first page if requested page doesn't exist
 
-        # Render page to image with high DPI for better analysis
-        mat = fitz.Matrix(2, 2)  # 2x zoom for better resolution
-        pix = page.get_pixmap(matrix=mat)
-        img_data = pix.tobytes("png")
+            page = doc[page_num]
 
-        # Convert to OpenCV format
-        nparr = np.frombuffer(img_data, np.uint8)
-        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        doc.close()
+            # Render page to image with high DPI for better analysis
+            mat = fitz.Matrix(2, 2)  # 2x zoom for better resolution
+            pix = page.get_pixmap(matrix=mat)
+            img_data = pix.tobytes("png")
 
-        return image
+            # Convert to OpenCV format
+            nparr = np.frombuffer(img_data, np.uint8)
+            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            doc.close()
+
+            return image
+        except Exception as e:
+            print(f"    ⚠ Warning: Could not convert PDF page to image: {e}")
+            # Return a blank image as fallback
+            return np.zeros((100, 100, 3), dtype=np.uint8)
 
     def detect_table_structure(self, image: np.ndarray) -> Dict[str, Any]:
         """
@@ -109,11 +117,24 @@ class VisualTableExtractor:
         """Extract tables using Camelot with structure-aware settings"""
         tables = []
         try:
-            # Choose extraction method based on detected structure
-            flavor = 'lattice' if structure_info['has_borders'] and structure_info['line_density'] > 0.001 else 'stream'
-            print(f"    Using Camelot {flavor} method (has_borders: {structure_info['has_borders']}, line_density: {structure_info['line_density']:.4f})")
+            # Validate PDF path
+            if not os.path.exists(pdf_path):
+                raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
-            camelot_tables = camelot.read_pdf(pdf_path, pages='all', flavor=flavor)
+            # Choose extraction method based on detected structure
+            flavor = 'lattice' if structure_info.get('has_borders', False) and structure_info.get('line_density', 0) > 0.001 else 'stream'
+            print(f"    Using Camelot {flavor} method (has_borders: {structure_info.get('has_borders', False)}, line_density: {structure_info.get('line_density', 0):.4f})")
+
+            # Try to read PDF with error handling
+            try:
+                camelot_tables = camelot.read_pdf(pdf_path, pages='all', flavor=flavor, suppress_stdout=True)
+            except Exception as camelot_error:
+                print(f"    ⚠ Camelot {flavor} failed, trying alternate method...")
+                # Try alternate flavor if first one fails
+                alternate_flavor = 'stream' if flavor == 'lattice' else 'lattice'
+                camelot_tables = camelot.read_pdf(pdf_path, pages='all', flavor=alternate_flavor, suppress_stdout=True)
+                print(f"    Using alternate Camelot {alternate_flavor} method")
+
             print(f"    Camelot returned {len(camelot_tables)} raw tables")
 
             for i, table in enumerate(camelot_tables):
@@ -125,14 +146,22 @@ class VisualTableExtractor:
                     non_empty_cells = df.notna().sum().sum()
                     print(f"        Non-empty cells: {non_empty_cells}/{df.shape[0] * df.shape[1]}")
 
-                    tables.append({
-                        'method': 'camelot',
-                        'table_index': i,
-                        'dataframe': df,
-                        'accuracy': getattr(table, 'accuracy', 0),
-                        'whitespace': getattr(table, 'whitespace', 0),
-                        'parsing_report': getattr(table, 'parsing_report', {})
-                    })
+                    # Analyze if this is truly a table or just text/content
+                    is_real_table = self._is_real_table(df)
+
+                    if is_real_table:
+                        tables.append({
+                            'method': 'camelot',
+                            'table_index': i,
+                            'dataframe': df,
+                            'content_type': 'table',
+                            'accuracy': getattr(table, 'accuracy', 0),
+                            'whitespace': getattr(table, 'whitespace', 0),
+                            'parsing_report': getattr(table, 'parsing_report', {})
+                        })
+                        print(f"        ✓ Identified as real table")
+                    else:
+                        print(f"        ⚠ Not a real table, likely text content")
                 else:
                     print(f"        Skipping empty table {i}")
 
@@ -354,6 +383,97 @@ class VisualTableExtractor:
         )
 
         return min(final_score, 1.0)
+
+    def _is_real_table(self, df: pd.DataFrame) -> bool:
+        """
+        Determine if the extracted content is a real table or just text/paragraph content.
+
+        Returns:
+            True if it's a real table, False if it's text/paragraph content
+        """
+        # Basic checks
+        if df.empty or df.shape[0] <= 1:
+            return False
+
+        # Check 1: Tables typically have multiple columns with meaningful data
+        if df.shape[1] < 2:
+            return False
+
+        # Check 2: Count non-empty cells per column
+        col_fill_rates = []
+        for col in df.columns:
+            non_empty = df[col].notna().sum()
+            fill_rate = non_empty / len(df) if len(df) > 0 else 0
+            col_fill_rates.append(fill_rate)
+
+        # If most columns are very sparse, it's likely not a real table
+        avg_fill_rate = sum(col_fill_rates) / len(col_fill_rates) if col_fill_rates else 0
+        if avg_fill_rate < 0.3:  # Less than 30% filled
+            return False
+
+        # Check 3: Look for numeric patterns (tables often have numbers)
+        has_numeric = False
+        for col in df.columns:
+            # Check if column has numeric values
+            col_data = df[col].dropna().astype(str)
+            numeric_count = sum(1 for val in col_data if any(c.isdigit() for c in str(val)))
+            if numeric_count > len(col_data) * 0.3:  # At least 30% numeric
+                has_numeric = True
+                break
+
+        # Check 4: Look for table-like patterns in headers or first row
+        first_row = df.iloc[0] if len(df) > 0 else []
+        table_keywords = ['qty', 'quantity', 'price', 'amount', 'total', 'rate',
+                         'cost', 'no', 'item', 'description', 'date', 'id',
+                         'name', 'value', 'count', 'unit', 's.no', 'sr.no']
+
+        has_table_pattern = False
+        for val in first_row:
+            val_str = str(val).lower().strip()
+            if any(keyword in val_str for keyword in table_keywords):
+                has_table_pattern = True
+                break
+
+        # Check 5: Consistent column structure (not just one column with text)
+        if df.shape[1] == 1:
+            # Single column - check if it's paragraph text
+            first_col = df.iloc[:, 0].dropna()
+            if len(first_col) > 0:
+                # Check average text length
+                avg_length = sum(len(str(val)) for val in first_col) / len(first_col)
+                if avg_length > 50:  # Long text indicates paragraphs
+                    return False
+
+        # Check 6: Tables usually have consistent data types in columns
+        has_consistent_structure = False
+        for col in df.columns:
+            col_data = df[col].dropna().astype(str)
+            if len(col_data) > 2:
+                # Check if values have similar lengths or patterns
+                lengths = [len(str(val)) for val in col_data]
+                if lengths:
+                    length_variance = max(lengths) - min(lengths)
+                    if length_variance < 20:  # Similar lengths suggest structured data
+                        has_consistent_structure = True
+                        break
+
+        # Decision logic
+        score = 0
+        if df.shape[1] >= 2:
+            score += 1
+        if df.shape[0] >= 3:
+            score += 1
+        if has_numeric:
+            score += 2
+        if has_table_pattern:
+            score += 2
+        if has_consistent_structure:
+            score += 1
+        if avg_fill_rate > 0.5:
+            score += 1
+
+        # Need at least a score of 3 to be considered a real table
+        return score >= 3
 
     def _identify_unique_tables(self, all_extractions: List[Dict]) -> List[Dict]:
         """
@@ -964,14 +1084,30 @@ class VisualTableExtractor:
         }
 
         try:
+            # Validate PDF file exists
+            if not os.path.exists(pdf_path):
+                error_result = {
+                    "error": f"PDF file not found: {pdf_path}",
+                    "debug_info": debug_info
+                }
+                return json.dumps(error_result, indent=2)
+
             # Step 1: Visual analysis of all pages for comprehensive structure detection
             print(f"🔍 Starting visual analysis of PDF: {pdf_path}")
             debug_info["extraction_steps"].append("visual_analysis_started")
 
             # Analyze first page for structure, but also check total page count
-            doc = fitz.open(pdf_path)
-            total_pages = len(doc)
-            doc.close()
+            try:
+                doc = fitz.open(pdf_path)
+                total_pages = len(doc)
+                doc.close()
+            except Exception as e:
+                error_result = {
+                    "error": f"Failed to open PDF with PyMuPDF: {str(e)}",
+                    "debug_info": debug_info,
+                    "suggestion": "Please ensure the PDF is not corrupted and is readable"
+                }
+                return json.dumps(error_result, indent=2)
 
             image = self.pdf_page_to_image(pdf_path, 0)
             structure_info = self.detect_table_structure(image)
@@ -1132,12 +1268,25 @@ def extract_tables_to_excel(pdf_path: str, excel_output_path: str = None, extrac
         # Extract first 3 tables only
         excel_bytes = extract_tables_to_excel('document.pdf', extract_all_unique=False)
     """
-    # Extract tables using Camelot
-    extractor = VisualTableExtractor()
-    json_result = extractor.extract_tables(pdf_path, extract_all_unique=extract_all_unique)
+    try:
+        # Extract tables using Camelot
+        extractor = VisualTableExtractor()
+        json_result = extractor.extract_tables(pdf_path, extract_all_unique=extract_all_unique)
 
-    # Convert to Excel
-    return extractor.convert_to_excel(json_result, excel_output_path)
+        # Check if extraction had errors
+        result_dict = json.loads(json_result)
+        if "error" in result_dict:
+            print(f"Error during extraction: {result_dict['error']}")
+            # Try simplified extraction without visual analysis
+            print("Attempting simplified extraction without visual analysis...")
+            json_result = extract_tables_simple(pdf_path)
+
+        # Convert to Excel
+        return extractor.convert_to_excel(json_result, excel_output_path)
+    except Exception as e:
+        print(f"Error in extract_tables_to_excel: {e}")
+        # Try a simple fallback method
+        return extract_tables_simple_to_excel(pdf_path, excel_output_path)
 
 def convert_main_layout_to_excel_tables_only(layout_data: Dict, output_path: str = None) -> Union[str, bytes]:
     """
@@ -1436,6 +1585,140 @@ def convert_main_layout_to_excel(layout_data: Dict, output_path: str = None) -> 
         str: File path if output_path provided, otherwise bytes of Excel file
     """
     return convert_main_layout_to_excel_tables_only(layout_data, output_path)
+
+# Simple fallback extraction methods (without visual analysis)
+def extract_tables_simple(pdf_path: str) -> str:
+    """
+    Simple table extraction without visual analysis - fallback method
+    """
+    try:
+        if not os.path.exists(pdf_path):
+            return json.dumps({"error": f"File not found: {pdf_path}"})
+
+        print("Running simple Camelot extraction (stream mode)...")
+
+        # Try stream mode first (works for most tables)
+        try:
+            tables = camelot.read_pdf(pdf_path, pages='all', flavor='stream', suppress_stdout=True)
+        except:
+            try:
+                # Fallback to lattice mode
+                print("Stream failed, trying lattice mode...")
+                tables = camelot.read_pdf(pdf_path, pages='all', flavor='lattice', suppress_stdout=True)
+            except Exception as e:
+                return json.dumps({"error": f"Camelot extraction failed: {str(e)}"})
+
+        # Convert to simple format
+        result = {
+            "extraction_summary": {
+                "total_tables": len(tables),
+                "extraction_method": "camelot_simple"
+            },
+            "tables": []
+        }
+
+        for i, table in enumerate(tables):
+            df = table.df
+            if not df.empty:
+                # Convert DataFrame to simple format
+                headers = df.iloc[0].tolist() if len(df) > 0 else []
+                rows = df.iloc[1:].values.tolist() if len(df) > 1 else []
+
+                result["tables"].append({
+                    "table_metadata": {
+                        "extraction_method": "camelot_simple",
+                        "table_index": i,
+                        "dimensions": {
+                            "rows": len(rows),
+                            "columns": len(headers)
+                        }
+                    },
+                    "headers": [{"name": str(h) if h else f"Column_{i+1}"} for i, h in enumerate(headers)],
+                    "rows": [{"columns": [{"raw_value": cell} for cell in row]} for row in rows]
+                })
+
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+    except Exception as e:
+        return json.dumps({"error": f"Simple extraction failed: {str(e)}"})
+
+def extract_tables_simple_to_excel(pdf_path: str, excel_output_path: str = None) -> Union[str, bytes]:
+    """
+    Simple direct PDF to Excel conversion - fallback method
+    """
+    try:
+        import pandas as pd
+        from openpyxl import Workbook
+
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"File not found: {pdf_path}")
+
+        # Try to extract tables with Camelot
+        tables = []
+        try:
+            tables = camelot.read_pdf(pdf_path, pages='all', flavor='stream', suppress_stdout=True)
+        except:
+            try:
+                tables = camelot.read_pdf(pdf_path, pages='all', flavor='lattice', suppress_stdout=True)
+            except:
+                pass
+
+        if not tables:
+            # Create empty Excel with error message
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Error"
+            ws["A1"] = "No tables could be extracted from the PDF"
+
+            if excel_output_path:
+                wb.save(excel_output_path)
+                return excel_output_path
+            else:
+                excel_bytes = io.BytesIO()
+                wb.save(excel_bytes)
+                excel_bytes.seek(0)
+                return excel_bytes.getvalue()
+
+        # Create Excel workbook
+        wb = Workbook()
+        wb.remove(wb.active)
+
+        for i, table in enumerate(tables):
+            df = table.df
+            if not df.empty:
+                ws = wb.create_sheet(f"Table_{i+1}")
+
+                # Write data directly
+                for row_idx, row in enumerate(df.values):
+                    for col_idx, value in enumerate(row):
+                        ws.cell(row=row_idx+1, column=col_idx+1, value=str(value) if value else "")
+
+        # Save Excel
+        if excel_output_path:
+            wb.save(excel_output_path)
+            return excel_output_path
+        else:
+            excel_bytes = io.BytesIO()
+            wb.save(excel_bytes)
+            excel_bytes.seek(0)
+            return excel_bytes.getvalue()
+
+    except Exception as e:
+        print(f"Simple Excel extraction failed: {e}")
+        # Return error in Excel format
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Error"
+        ws["A1"] = f"Extraction failed: {str(e)}"
+
+        if excel_output_path:
+            wb.save(excel_output_path)
+            return excel_output_path
+        else:
+            excel_bytes = io.BytesIO()
+            wb.save(excel_bytes)
+            excel_bytes.seek(0)
+            return excel_bytes.getvalue()
 
 # Backward compatibility function for positional extraction
 def extract_tables_with_position(pdf_path: str) -> Dict:
