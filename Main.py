@@ -3,11 +3,31 @@ import os
 import json
 import cv2
 import numpy as np
+import logging
+from datetime import datetime
 from extractors.text_extractor import extract_text_with_position
 from extractors.table_extractor import extract_tables_with_position
 from extractors.image_extractor import extract_images_with_ocr_and_position
 import fitz  # PyMuPDF
 from typing import Dict, List, Tuple, Any
+
+# Configure logging
+log_dir = 'logs'
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+log_filename = os.path.join(log_dir, f'pdf_extractor_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_filename),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 def analyze_pdf_content(pdf_path: str) -> Dict[str, Any]:
     """
@@ -18,6 +38,7 @@ def analyze_pdf_content(pdf_path: str) -> Dict[str, Any]:
 
     Returns a detailed analysis of content types per page.
     """
+    logger.info(f"Starting PDF content analysis for: {pdf_path}")
     content_analysis = {
         'total_pages': 0,
         'page_analysis': {},
@@ -34,6 +55,7 @@ def analyze_pdf_content(pdf_path: str) -> Dict[str, Any]:
     try:
         doc = fitz.open(pdf_path)
         content_analysis['total_pages'] = len(doc)
+        logger.info(f"PDF opened successfully. Total pages: {len(doc)}")
 
         for page_num in range(len(doc)):
             page = doc[page_num]
@@ -46,6 +68,7 @@ def analyze_pdf_content(pdf_path: str) -> Dict[str, Any]:
             image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
             # Analyze the page
+            logger.debug(f"Analyzing page {page_num + 1} with OpenCV")
             page_info = analyze_page_with_opencv(image, page_num + 1)
             content_analysis['page_analysis'][f'page_{page_num + 1}'] = page_info
 
@@ -53,16 +76,21 @@ def analyze_pdf_content(pdf_path: str) -> Dict[str, Any]:
             if page_info['has_tables']:
                 content_analysis['summary']['has_tables'] = True
                 content_analysis['summary']['table_pages'].append(page_num + 1)
+                logger.debug(f"Tables detected on page {page_num + 1}")
             if page_info['has_images']:
                 content_analysis['summary']['has_images'] = True
                 content_analysis['summary']['image_pages'].append(page_num + 1)
+                logger.debug(f"Images detected on page {page_num + 1}")
             if page_info['has_text']:
                 content_analysis['summary']['has_text'] = True
                 content_analysis['summary']['text_pages'].append(page_num + 1)
+                logger.debug(f"Text detected on page {page_num + 1}")
 
         doc.close()
+        logger.info(f"PDF content analysis completed. Summary: Tables={content_analysis['summary']['has_tables']}, Images={content_analysis['summary']['has_images']}, Text={content_analysis['summary']['has_text']}")
 
     except Exception as e:
+        logger.error(f"Error analyzing PDF: {e}", exc_info=True)
         print(f"Error analyzing PDF: {e}")
 
     return content_analysis
@@ -299,6 +327,8 @@ def get_document_layout(pdf_path, use_opencv_analysis=True):
         pdf_path: Path to the PDF file
         use_opencv_analysis: If True, uses OpenCV to pre-analyze content types for better extraction
     """
+    logger.info(f"Starting document layout extraction for: {pdf_path}")
+    logger.info(f"OpenCV analysis enabled: {use_opencv_analysis}")
     final_output = {}
 
     # Step 0: Analyze content types using OpenCV (optional but recommended)
@@ -315,22 +345,30 @@ def get_document_layout(pdf_path, use_opencv_analysis=True):
         # Only extract tables if tables are detected
         if content_analysis['summary']['has_tables']:
             print("\nStep 1: Extracting tables (tables detected)...")
+            logger.info(f"Extracting tables from pages: {content_analysis['summary']['table_pages']}")
             table_content_by_page = extract_tables_with_position(pdf_path)
+            logger.info(f"Tables extracted: {len(table_content_by_page)} pages with tables")
         else:
             print("\nStep 1: Skipping table extraction (no tables detected)")
+            logger.info("Skipping table extraction - no tables detected")
             table_content_by_page = {}
 
         # Only extract images if images are detected
         if content_analysis['summary']['has_images']:
             print("Step 2: Extracting images and charts (images detected)...")
+            logger.info(f"Extracting images from pages: {content_analysis['summary']['image_pages']}")
             image_content_by_page = extract_images_with_ocr_and_position(pdf_path)
+            logger.info(f"Images extracted: {len(image_content_by_page)} pages with images")
         else:
             print("Step 2: Skipping image extraction (no images detected)")
+            logger.info("Skipping image extraction - no images detected")
             image_content_by_page = {}
 
         # Always extract text as fallback
         print("Step 3: Extracting and filtering text blocks...")
+        logger.info("Extracting text from all pages")
         text_content_by_page = extract_text_with_position(pdf_path)
+        logger.info(f"Text extracted: {len(text_content_by_page)} pages with text")
     else:
         # Traditional extraction without pre-analysis
         print("Step 1: Extracting tables...")
@@ -345,13 +383,16 @@ def get_document_layout(pdf_path, use_opencv_analysis=True):
     try:
         with fitz.open(pdf_path) as pdf_doc:
             num_pages = len(pdf_doc)
+        logger.info(f"Processing {num_pages} pages for final layout assembly")
     except Exception as e:
+        logger.error(f"Could not open PDF to get page count: {e}", exc_info=True)
         return {"error": f"Could not open PDF to get page count: {e}"}
 
     # Process each page to assemble, filter, sort, and number the content
     for i in range(num_pages):
         page_number = i + 1
         page_key = f"page_{page_number}"
+        logger.debug(f"Processing page {page_number} for layout assembly")
         
         page_elements = []
         
@@ -418,7 +459,9 @@ def get_document_layout(pdf_path, use_opencv_analysis=True):
             page_output.append(clean_element)
 
         final_output[page_key] = page_output
+        logger.debug(f"Page {page_number} processed: {len(page_output)} elements")
 
+    logger.info(f"Document layout extraction completed. Total pages processed: {num_pages}")
     return final_output
 
 def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Dict[str, Any]:
@@ -433,6 +476,8 @@ def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Di
     Returns:
         Dictionary with extracted content organized by type
     """
+    logger.info(f"Starting intelligent PDF extraction for: {pdf_path}")
+    logger.info(f"Output format: {output_format}")
     print("=" * 60)
     print("Starting Intelligent PDF Content Extraction")
     print("=" * 60)
@@ -467,6 +512,7 @@ def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Di
     # Extract tables if detected
     if content_analysis['summary']['has_tables']:
         print("\n🔍 Extracting tables with specialized table extractor...")
+        logger.info("Extracting tables with specialized extractor")
         try:
             from extractors.table_extractor import extract_tables_with_cv, extract_tables_to_excel
 
@@ -479,6 +525,7 @@ def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Di
                     'pages': content_analysis['summary']['table_pages']
                 }
                 print(f"    ✓ Tables extracted to Excel: {excel_output}")
+                logger.info(f"Tables extracted to Excel: {excel_output}")
             else:
                 # JSON extraction for tables
                 tables_json = extract_tables_with_cv(pdf_path)
@@ -488,13 +535,16 @@ def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Di
                     'pages': content_analysis['summary']['table_pages']
                 }
                 print(f"    ✓ Tables extracted to JSON format")
+                logger.info("Tables extracted to JSON format")
         except Exception as e:
+            logger.error(f"Table extraction failed: {e}", exc_info=True)
             print(f"    ❌ Table extraction failed: {e}")
             result['tables'] = {'error': str(e)}
 
     # Extract images if detected
     if content_analysis['summary']['has_images']:
         print("\n🖼️ Extracting images with OCR...")
+        logger.info("Extracting images with OCR")
         try:
             images = extract_images_with_ocr_and_position(pdf_path)
             result['images'] = {
@@ -503,13 +553,16 @@ def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Di
                 'count': sum(len(imgs) for imgs in images.values())
             }
             print(f"    ✓ {result['images']['count']} images extracted")
+            logger.info(f"Extracted {result['images']['count']} images from {len(result['images']['pages'])} pages")
         except Exception as e:
+            logger.error(f"Image extraction failed: {e}", exc_info=True)
             print(f"    ❌ Image extraction failed: {e}")
             result['images'] = {'error': str(e)}
 
     # Extract text content
     if content_analysis['summary']['has_text']:
         print("\n📝 Extracting text content...")
+        logger.info("Extracting text content")
         try:
             text_content = extract_text_with_position(pdf_path)
             result['text'] = {
@@ -518,7 +571,9 @@ def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Di
                 'paragraphs': sum(len(texts) for texts in text_content.values())
             }
             print(f"    ✓ {result['text']['paragraphs']} text blocks extracted")
+            logger.info(f"Extracted {result['text']['paragraphs']} text blocks from {len(result['text']['pages'])} pages")
         except Exception as e:
+            logger.error(f"Text extraction failed: {e}", exc_info=True)
             print(f"    ❌ Text extraction failed: {e}")
             result['text'] = {'error': str(e)}
 
@@ -527,6 +582,7 @@ def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Di
         print("\n🔄 Combining all content with layout preservation...")
         result['combined_output'] = get_document_layout(pdf_path, use_opencv_analysis=False)
 
+    logger.info("Intelligent PDF extraction completed successfully")
     print("\n" + "=" * 60)
     print("✅ Intelligent extraction completed!")
     print("=" * 60)
@@ -535,6 +591,7 @@ def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Di
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
+        logger.error("Insufficient arguments provided")
         print("Usage: python main.py <path_to_pdf> [mode] [format]")
         print("  mode: 'intelligent' (default) or 'traditional'")
         print("  format: 'json' (default), 'excel', or 'both'")
@@ -549,9 +606,11 @@ if __name__ == "__main__":
     output_format = sys.argv[3] if len(sys.argv) > 3 else 'json'
 
     if not os.path.exists(pdf_file_path):
+        logger.error(f"PDF file not found at {pdf_file_path}")
         print(f"Error: PDF file not found at {pdf_file_path}")
         sys.exit(1)
 
+    logger.info(f"Starting PDF analysis - File: {pdf_file_path}, Mode: {mode}, Format: {output_format}")
     print(f"Analyzing PDF: {pdf_file_path}")
     print(f"Mode: {mode}")
     print(f"Output format: {output_format}")
@@ -568,10 +627,12 @@ if __name__ == "__main__":
                 clean_result = {k: v for k, v in result.items() if v is not None}
                 json.dump(clean_result, f, ensure_ascii=False, indent=2)
             print(f"\n📄 Results saved to {output_filename}")
+            logger.info(f"Results saved to {output_filename}")
 
         if output_format in ['excel', 'both'] and result.get('tables'):
             if result['tables'].get('format') == 'excel':
                 print(f"\n📊 Tables saved to Excel: {result['tables'].get('file_path', 'N/A')}")
+                logger.info(f"Tables saved to Excel: {result['tables'].get('file_path', 'N/A')}")
     else:
         # Traditional extraction
         structured_content = get_document_layout(pdf_file_path)
@@ -581,6 +642,7 @@ if __name__ == "__main__":
         with open(output_filename, 'w', encoding='utf-8') as f:
             json.dump(structured_content, f, ensure_ascii=False, indent=2)
 
+        logger.info(f"Traditional extraction completed. Results saved to {output_filename}")
         print("\n--- FINAL EXTRACTED JSON (Spatially Ordered, De-duplicated, and Numbered) ---")
         print(f"Results saved to {output_filename}")
 

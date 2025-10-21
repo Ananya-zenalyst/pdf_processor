@@ -13,6 +13,10 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils.dataframe import dataframe_to_rows
 import io
+import logging
+
+# Configure logger
+logger = logging.getLogger(__name__)
 
 class VisualTableExtractor:
     """
@@ -36,9 +40,11 @@ class VisualTableExtractor:
     def pdf_page_to_image(self, pdf_path: str, page_num: int = 0) -> np.ndarray:
         """Convert PDF page to OpenCV image for visual analysis"""
         try:
+            logger.debug(f"Converting PDF page {page_num} to image for analysis")
             doc = fitz.open(pdf_path)
             if page_num >= len(doc):
                 page_num = 0  # Default to first page if requested page doesn't exist
+                logger.debug(f"Requested page {page_num} doesn't exist, using page 0")
 
             page = doc[page_num]
 
@@ -51,9 +57,10 @@ class VisualTableExtractor:
             nparr = np.frombuffer(img_data, np.uint8)
             image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             doc.close()
-
+            logger.debug("PDF page successfully converted to image")
             return image
         except Exception as e:
+            logger.warning(f"Could not convert PDF page to image: {e}")
             print(f"    ⚠ Warning: Could not convert PDF page to image: {e}")
             # Return a blank image as fallback
             return np.zeros((100, 100, 3), dtype=np.uint8)
@@ -115,26 +122,32 @@ class VisualTableExtractor:
 
     def extract_with_camelot(self, pdf_path: str, structure_info: Dict) -> List[Dict]:
         """Extract tables using Camelot with structure-aware settings"""
+        logger.info(f"Starting Camelot extraction for: {pdf_path}")
         tables = []
         try:
             # Validate PDF path
             if not os.path.exists(pdf_path):
+                logger.error(f"PDF file not found: {pdf_path}")
                 raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
             # Choose extraction method based on detected structure
             flavor = 'lattice' if structure_info.get('has_borders', False) and structure_info.get('line_density', 0) > 0.001 else 'stream'
+            logger.info(f"Using Camelot {flavor} method based on structure analysis")
             print(f"    Using Camelot {flavor} method (has_borders: {structure_info.get('has_borders', False)}, line_density: {structure_info.get('line_density', 0):.4f})")
 
             # Try to read PDF with error handling
             try:
                 camelot_tables = camelot.read_pdf(pdf_path, pages='all', flavor=flavor, suppress_stdout=True)
             except Exception as camelot_error:
+                logger.warning(f"Camelot {flavor} failed: {camelot_error}, trying alternate method")
                 print(f"    ⚠ Camelot {flavor} failed, trying alternate method...")
                 # Try alternate flavor if first one fails
                 alternate_flavor = 'stream' if flavor == 'lattice' else 'lattice'
                 camelot_tables = camelot.read_pdf(pdf_path, pages='all', flavor=alternate_flavor, suppress_stdout=True)
+                logger.info(f"Using alternate Camelot {alternate_flavor} method")
                 print(f"    Using alternate Camelot {alternate_flavor} method")
 
+            logger.info(f"Camelot returned {len(camelot_tables)} raw tables")
             print(f"    Camelot returned {len(camelot_tables)} raw tables")
 
             for i, table in enumerate(camelot_tables):
@@ -159,13 +172,16 @@ class VisualTableExtractor:
                             'whitespace': getattr(table, 'whitespace', 0),
                             'parsing_report': getattr(table, 'parsing_report', {})
                         })
+                        logger.debug(f"Table {i} identified as real table")
                         print(f"        ✓ Identified as real table")
                     else:
+                        logger.debug(f"Table {i} not a real table, likely text content")
                         print(f"        ⚠ Not a real table, likely text content")
                 else:
                     print(f"        Skipping empty table {i}")
 
         except Exception as e:
+            logger.error(f"Camelot extraction failed: {e}", exc_info=True)
             print(f"    ❌ Camelot extraction failed: {e}")
             import traceback
             print(f"    Traceback: {traceback.format_exc()}")
@@ -227,10 +243,12 @@ class VisualTableExtractor:
 
     def extract_with_pdfplumber(self, pdf_path: str, structure_info: Dict) -> List[Dict]:
         """Extract tables using pdfplumber with adaptive settings"""
+        logger.info(f"Starting PDFplumber extraction for: {pdf_path}")
         tables = []
 
         try:
             with pdfplumber.open(pdf_path) as pdf:
+                logger.info(f"PDFplumber processing {len(pdf.pages)} pages")
                 print(f"    PDFplumber processing {len(pdf.pages)} pages")
 
                 for page_num, page in enumerate(pdf.pages):
@@ -307,6 +325,7 @@ class VisualTableExtractor:
                             continue
 
         except Exception as e:
+            logger.error(f"PDFplumber extraction failed: {e}", exc_info=True)
             print(f"    ❌ PDFplumber extraction failed: {e}")
             import traceback
             print(f"    Traceback: {traceback.format_exc()}")
@@ -1077,6 +1096,8 @@ class VisualTableExtractor:
         Returns:
             JSON string with all extracted tables and metadata
         """
+        logger.info(f"Starting table extraction for: {pdf_path}")
+        logger.info(f"Extract all unique tables: {extract_all_unique}")
         debug_info = {
             "pdf_path": pdf_path,
             "extraction_steps": [],
@@ -1093,6 +1114,7 @@ class VisualTableExtractor:
                 return json.dumps(error_result, indent=2)
 
             # Step 1: Visual analysis of all pages for comprehensive structure detection
+            logger.info("Starting visual analysis of PDF structure")
             print(f"🔍 Starting visual analysis of PDF: {pdf_path}")
             debug_info["extraction_steps"].append("visual_analysis_started")
 
@@ -1113,6 +1135,7 @@ class VisualTableExtractor:
             structure_info = self.detect_table_structure(image)
             structure_info['total_pages'] = total_pages
 
+            logger.info(f"Visual analysis completed - Pages: {total_pages}, Tables: {structure_info.get('table_count', 0)}, Has borders: {structure_info.get('has_borders', False)}")
             print(f"📊 Visual analysis results:")
             print(f"  - Total pages: {total_pages}")
             print(f"  - Table count: {structure_info.get('table_count', 0)}")
@@ -1134,10 +1157,12 @@ class VisualTableExtractor:
             print(f"  Camelot found {len(camelot_results)} tables")
             all_extractions.extend(camelot_results)
 
+            logger.info(f"Total tables found: {len(all_extractions)}")
             print(f"\n📈 Total tables found: {len(all_extractions)}")
             debug_info["total_extractions"] = len(all_extractions)
 
             if not all_extractions:
+                logger.warning("No tables found with Camelot extraction")
                 error_result = {
                     "error": "No tables found with Camelot",
                     "debug_info": debug_info,
@@ -1190,12 +1215,14 @@ class VisualTableExtractor:
                 print(f"  ✓ Converted {extraction['method']} table to Excel format")
 
             debug_info["extraction_steps"].append("output_created")
+            logger.info(f"Table extraction completed successfully - {len(output['tables'])} tables in output")
             print(f"✅ Extraction completed successfully!")
 
             return json.dumps(output, indent=2, ensure_ascii=False)
 
         except Exception as e:
             import traceback
+            logger.error(f"Table extraction failed: {str(e)}", exc_info=True)
             error_result = {
                 "error": f"Extraction failed: {str(e)}",
                 "traceback": traceback.format_exc(),
@@ -1727,6 +1754,7 @@ def extract_tables_with_position(pdf_path: str) -> Dict:
     in the format expected by main.py
     """
     try:
+        logger.info(f"extract_tables_with_position called for: {pdf_path}")
         print(f"🔄 extract_tables_with_position called for: {pdf_path}")
 
         # Use the new CV-enhanced extractor with silent mode
@@ -1745,12 +1773,14 @@ def extract_tables_with_position(pdf_path: str) -> Dict:
             sys.stdout = old_stdout
 
         result = json.loads(result_json)
+        logger.info(f"CV extraction found {len(result.get('tables', []))} tables")
         print(f"📊 CV extraction found {len(result.get('tables', []))} tables")
 
         # Convert to expected format for main.py
         page_based_output = {}
 
         if "error" in result:
+            logger.warning("Error in CV extraction, returning empty")
             print("❌ Error in CV extraction, returning empty")
             return {"page_1": []}
 
@@ -1821,14 +1851,17 @@ def extract_tables_with_position(pdf_path: str) -> Dict:
                     page_based_output["page_1"] = []
                 page_based_output["page_1"].append(table_entry)
 
+            logger.info(f"Successfully converted {len(page_based_output.get('page_1', []))} tables to position format")
             print(f"✅ Successfully converted {len(page_based_output.get('page_1', []))} tables")
         else:
+            logger.warning("No tables found in CV extraction result")
             print("⚠️  No tables found in CV extraction result")
 
         return page_based_output
 
     except Exception as e:
         import traceback
+        logger.error(f"Error in extract_tables_with_position: {e}", exc_info=True)
         print(f"❌ Error in extract_tables_with_position: {e}")
         print(f"Traceback: {traceback.format_exc()}")
         return {"page_1": []}

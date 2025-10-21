@@ -1,5 +1,9 @@
 import pdfplumber
 from itertools import groupby
+import logging
+
+# Configure logger
+logger = logging.getLogger(__name__)
 
 def extract_text_with_position(pdf_path):
     """
@@ -15,16 +19,21 @@ def extract_text_with_position(pdf_path):
               values are lists of extracted text block dictionaries, each
               containing content and a bounding box.
     """
+    logger.info(f"Starting text extraction from: {pdf_path}")
     all_text_data = {}
 
     with pdfplumber.open(pdf_path) as pdf:
+        logger.info(f"PDF opened with pdfplumber. Total pages: {len(pdf.pages)}")
         for i, page in enumerate(pdf.pages):
             page_number = i + 1
+            logger.debug(f"Processing page {page_number} for text extraction")
             
             # Extract words with their precise bounding boxes
             words = page.extract_words(x_tolerance=1, y_tolerance=1, keep_blank_chars=False)
-            
+            logger.debug(f"Page {page_number}: Found {len(words)} words")
+
             if not words:
+                logger.debug(f"Page {page_number}: No words found")
                 all_text_data[f"page_{page_number}"] = []
                 continue
 
@@ -47,8 +56,11 @@ def extract_text_with_position(pdf_path):
                     })
 
             if not lines:
+                logger.debug(f"Page {page_number}: No lines formed")
                 all_text_data[f"page_{page_number}"] = []
                 continue
+
+            logger.debug(f"Page {page_number}: Formed {len(lines)} lines")
 
             # Group lines into paragraphs
             paragraphs = []
@@ -99,6 +111,8 @@ def extract_text_with_position(pdf_path):
                 })
 
             all_text_data[f"page_{page_number}"] = paragraphs
+            logger.debug(f"Page {page_number}: Created {len(paragraphs)} paragraphs")
 
+    logger.info(f"Text extraction completed. Processed {len(all_text_data)} pages")
     return all_text_data
 

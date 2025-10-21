@@ -4,16 +4,38 @@ from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse, Response
 from fastapi.responses import StreamingResponse
 import io
+import logging
+from datetime import datetime
 
 # Import the main extraction function from your controller
 from main import get_document_layout
 from extractors.table_extractor import extract_tables_to_excel, convert_main_layout_to_excel
+
+# Configure logging
+log_dir = 'logs'
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+log_filename = os.path.join(log_dir, f'api_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_filename),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="PDF Data Extraction API",
     description="An advanced API to extract text, tables, and images from a PDF, preserving the document's spatial layout.",
     version="3.0.0"
 )
+
+logger.info("PDF Data Extraction API initialized")
 
 # In-memory "database" to store task status and results.
 # In a production environment, you would replace this with a real database like Redis.
@@ -29,19 +51,24 @@ def process_pdf_in_background(task_id: str, pdf_path: str):
     This function runs in the background to process the PDF.
     It updates the task status in the tasks_db as it progresses.
     """
+    logger.info(f"Starting background processing for task {task_id}, PDF: {pdf_path}")
     try:
         # Update status to PROCESSING
         tasks_db[task_id]["status"] = "PROCESSING"
+        logger.info(f"Task {task_id} status updated to PROCESSING")
         
         # Call the core extraction logic from main.py
+        logger.info(f"Task {task_id}: Starting document layout extraction")
         structured_data = get_document_layout(pdf_path)
-        
+
         # On success, update status and store the result
         tasks_db[task_id]["status"] = "SUCCESS"
         tasks_db[task_id]["result"] = structured_data
+        logger.info(f"Task {task_id} completed successfully")
 
     except Exception as e:
         # On failure, update status and store the error message
+        logger.error(f"Error processing task {task_id}: {e}", exc_info=True)
         print(f"Error processing task {task_id}: {e}")
         tasks_db[task_id]["status"] = "FAILURE"
         tasks_db[task_id]["result"] = {"error": str(e)}
@@ -49,6 +76,7 @@ def process_pdf_in_background(task_id: str, pdf_path: str):
         # Clean up by removing the uploaded file after processing
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
+            logger.info(f"Task {task_id}: Cleaned up uploaded file {pdf_path}")
 
 
 @app.post("/extract/", status_code=202)
@@ -59,6 +87,7 @@ async def extract_data_from_pdf(background_tasks: BackgroundTasks, file: UploadF
     """
     # Generate a unique task ID
     task_id = str(uuid.uuid4())
+    logger.info(f"New extraction request - Task ID: {task_id}, File: {file.filename}")
     
     # Define the path where the uploaded file will be saved
     file_path = os.path.join(UPLOADS_DIR, f"{task_id}_{file.filename}")
@@ -67,7 +96,9 @@ async def extract_data_from_pdf(background_tasks: BackgroundTasks, file: UploadF
     try:
         with open(file_path, "wb") as buffer:
             buffer.write(await file.read())
+        logger.info(f"Task {task_id}: File saved to {file_path}")
     except Exception as e:
+        logger.error(f"Task {task_id}: Failed to save uploaded file: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
 
     # Initialize the task in our "database"
@@ -75,6 +106,7 @@ async def extract_data_from_pdf(background_tasks: BackgroundTasks, file: UploadF
 
     # Add the processing function to run in the background
     background_tasks.add_task(process_pdf_in_background, task_id, file_path)
+    logger.info(f"Task {task_id}: Added to background processing queue")
 
     # Return the task ID to the client
     return {"task_id": task_id, "message": "File upload successful. Processing has started."}
@@ -86,20 +118,26 @@ async def get_task_status(task_id: str):
     Poll this endpoint with a task ID to check the status of the extraction
     process and retrieve the final JSON result when complete.
     """
+    logger.info(f"Status check for task {task_id}")
     task = tasks_db.get(task_id)
     if not task:
+        logger.warning(f"Task {task_id} not found")
         raise HTTPException(status_code=404, detail="Task not found.")
 
     if task["status"] == "SUCCESS":
+        logger.info(f"Task {task_id} status: SUCCESS")
         return JSONResponse(content={"status": task["status"], "data": task["result"]})
-    
+
     if task["status"] == "FAILURE":
+        logger.info(f"Task {task_id} status: FAILURE")
         return JSONResponse(status_code=500, content={"status": task["status"], "error": task["result"]})
-        
+
+    logger.info(f"Task {task_id} status: {task['status']}")
     return {"status": task["status"]}
 
 @app.post("/extract-to-excel/")
 async def extract_pdf_to_excel(file: UploadFile = File(...)):
+    logger.info(f"Excel extraction request for file: {file.filename}")
     """
     Extract ONLY TABLE DATA from PDF and return as Excel file download.
 
@@ -122,22 +160,27 @@ async def extract_pdf_to_excel(file: UploadFile = File(...)):
         # Save the uploaded file
         with open(file_path, "wb") as buffer:
             buffer.write(await file.read())
+        logger.info(f"File saved for Excel extraction: {file_path}")
 
         # Use the main extraction pipeline
+        logger.info("Starting layout extraction for Excel conversion")
         layout_data = get_document_layout(file_path)
 
         # Convert to Excel using the main layout data
+        logger.info("Converting layout data to Excel format")
         excel_bytes = convert_main_layout_to_excel(layout_data)
 
         # Clean up the uploaded file
         if os.path.exists(file_path):
             os.remove(file_path)
+            logger.info(f"Cleaned up file: {file_path}")
 
         # Create filename for download
         base_filename = os.path.splitext(file.filename)[0] if file.filename else "extracted_content"
         excel_filename = f"{base_filename}_content.xlsx"
 
         # Return Excel file as download
+        logger.info(f"Returning Excel file: {excel_filename}")
         return StreamingResponse(
             io.BytesIO(excel_bytes),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -145,9 +188,11 @@ async def extract_pdf_to_excel(file: UploadFile = File(...)):
         )
 
     except Exception as e:
+        logger.error(f"Excel extraction failed: {str(e)}", exc_info=True)
         # Clean up file if it exists
         if os.path.exists(file_path):
             os.remove(file_path)
+            logger.info(f"Cleaned up file after error: {file_path}")
 
         raise HTTPException(
             status_code=500,
@@ -156,6 +201,7 @@ async def extract_pdf_to_excel(file: UploadFile = File(...)):
 
 @app.post("/extract-tables-to-excel/")
 async def extract_only_tables_to_excel(file: UploadFile = File(...)):
+    logger.info(f"CV-enhanced table extraction request for file: {file.filename}")
     """
     Extract only tables from PDF using CV-enhanced method and return as Excel file.
 
@@ -170,19 +216,23 @@ async def extract_only_tables_to_excel(file: UploadFile = File(...)):
         # Save the uploaded file
         with open(file_path, "wb") as buffer:
             buffer.write(await file.read())
+        logger.info(f"File saved for CV table extraction: {file_path}")
 
         # Extract tables using CV-enhanced method
+        logger.info("Starting CV-enhanced table extraction")
         excel_bytes = extract_tables_to_excel(file_path)
 
         # Clean up the uploaded file
         if os.path.exists(file_path):
             os.remove(file_path)
+            logger.info(f"Cleaned up file: {file_path}")
 
         # Create filename for download
         base_filename = os.path.splitext(file.filename)[0] if file.filename else "extracted_tables"
         excel_filename = f"{base_filename}_tables_cv.xlsx"
 
         # Return Excel file as download
+        logger.info(f"Returning CV-extracted Excel file: {excel_filename}")
         return StreamingResponse(
             io.BytesIO(excel_bytes),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -190,9 +240,11 @@ async def extract_only_tables_to_excel(file: UploadFile = File(...)):
         )
 
     except Exception as e:
+        logger.error(f"CV table extraction failed: {str(e)}", exc_info=True)
         # Clean up file if it exists
         if os.path.exists(file_path):
             os.remove(file_path)
+            logger.info(f"Cleaned up file after error: {file_path}")
 
         raise HTTPException(
             status_code=500,
@@ -201,5 +253,6 @@ async def extract_only_tables_to_excel(file: UploadFile = File(...)):
 
 @app.get("/")
 async def root():
+    logger.info("Root endpoint accessed")
     return {"message": "Welcome to the PDF Data Extraction API. Go to /docs to see the API documentation."}
 

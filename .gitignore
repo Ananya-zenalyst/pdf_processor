@@ -152,3 +152,7 @@ cache/
 Dockerfile.local
 docker-compose.override.yml
 .dockerignore.local
+Logs
+__pycache__/*
+LOGGING.md 
+test_logging.py
