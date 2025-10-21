@@ -59,6 +59,8 @@ def analyze_pdf_content(pdf_path: str) -> Dict[str, Any]:
 
         for page_num in range(len(doc)):
             page = doc[page_num]
+            progress_percentage = ((page_num + 1) / len(doc)) * 100
+            logger.info(f"Analyzing page {page_num + 1}/{len(doc)} ({progress_percentage:.1f}% complete)")
 
             # Convert page to image for OpenCV analysis
             mat = fitz.Matrix(2, 2)  # 2x zoom for better analysis
@@ -87,7 +89,7 @@ def analyze_pdf_content(pdf_path: str) -> Dict[str, Any]:
                 logger.debug(f"Text detected on page {page_num + 1}")
 
         doc.close()
-        logger.info(f"PDF content analysis completed. Summary: Tables={content_analysis['summary']['has_tables']}, Images={content_analysis['summary']['has_images']}, Text={content_analysis['summary']['has_text']}")
+        logger.info(f"PDF content analysis completed (100% complete). Summary: Tables={content_analysis['summary']['has_tables']}, Images={content_analysis['summary']['has_images']}, Text={content_analysis['summary']['has_text']}")
 
     except Exception as e:
         logger.error(f"Error analyzing PDF: {e}", exc_info=True)
@@ -345,9 +347,10 @@ def get_document_layout(pdf_path, use_opencv_analysis=True):
         # Only extract tables if tables are detected
         if content_analysis['summary']['has_tables']:
             print("\nStep 1: Extracting tables (tables detected)...")
-            logger.info(f"Extracting tables from pages: {content_analysis['summary']['table_pages']}")
+            logger.info(f"Extracting tables from {len(content_analysis['summary']['table_pages'])} pages: {content_analysis['summary']['table_pages']}")
             table_content_by_page = extract_tables_with_position(pdf_path)
-            logger.info(f"Tables extracted: {len(table_content_by_page)} pages with tables")
+            extraction_percentage = (len(table_content_by_page) / len(content_analysis['summary']['table_pages']) * 100) if content_analysis['summary']['table_pages'] else 100
+            logger.info(f"Tables extracted: {len(table_content_by_page)} pages with tables ({extraction_percentage:.1f}% extraction rate)")
         else:
             print("\nStep 1: Skipping table extraction (no tables detected)")
             logger.info("Skipping table extraction - no tables detected")
@@ -356,9 +359,10 @@ def get_document_layout(pdf_path, use_opencv_analysis=True):
         # Only extract images if images are detected
         if content_analysis['summary']['has_images']:
             print("Step 2: Extracting images and charts (images detected)...")
-            logger.info(f"Extracting images from pages: {content_analysis['summary']['image_pages']}")
+            logger.info(f"Extracting images from {len(content_analysis['summary']['image_pages'])} pages: {content_analysis['summary']['image_pages']}")
             image_content_by_page = extract_images_with_ocr_and_position(pdf_path)
-            logger.info(f"Images extracted: {len(image_content_by_page)} pages with images")
+            extraction_percentage = (len(image_content_by_page) / len(content_analysis['summary']['image_pages']) * 100) if content_analysis['summary']['image_pages'] else 100
+            logger.info(f"Images extracted: {len(image_content_by_page)} pages with images ({extraction_percentage:.1f}% extraction rate)")
         else:
             print("Step 2: Skipping image extraction (no images detected)")
             logger.info("Skipping image extraction - no images detected")
@@ -368,7 +372,8 @@ def get_document_layout(pdf_path, use_opencv_analysis=True):
         print("Step 3: Extracting and filtering text blocks...")
         logger.info("Extracting text from all pages")
         text_content_by_page = extract_text_with_position(pdf_path)
-        logger.info(f"Text extracted: {len(text_content_by_page)} pages with text")
+        extraction_percentage = (len(text_content_by_page) / content_analysis['total_pages'] * 100) if content_analysis['total_pages'] > 0 else 0
+        logger.info(f"Text extracted: {len(text_content_by_page)} pages with text ({extraction_percentage:.1f}% of total pages)")
     else:
         # Traditional extraction without pre-analysis
         print("Step 1: Extracting tables...")
@@ -389,10 +394,12 @@ def get_document_layout(pdf_path, use_opencv_analysis=True):
         return {"error": f"Could not open PDF to get page count: {e}"}
 
     # Process each page to assemble, filter, sort, and number the content
+    total_elements_processed = 0
     for i in range(num_pages):
         page_number = i + 1
         page_key = f"page_{page_number}"
-        logger.debug(f"Processing page {page_number} for layout assembly")
+        progress_percentage = (page_number / num_pages) * 100
+        logger.debug(f"Processing page {page_number}/{num_pages} for layout assembly ({progress_percentage:.1f}% complete)")
         
         page_elements = []
         
@@ -459,9 +466,10 @@ def get_document_layout(pdf_path, use_opencv_analysis=True):
             page_output.append(clean_element)
 
         final_output[page_key] = page_output
-        logger.debug(f"Page {page_number} processed: {len(page_output)} elements")
+        total_elements_processed += len(page_output)
+        logger.debug(f"Page {page_number} processed: {len(page_output)} elements (Total elements so far: {total_elements_processed})")
 
-    logger.info(f"Document layout extraction completed. Total pages processed: {num_pages}")
+    logger.info(f"Document layout extraction completed (100%). Total pages processed: {num_pages}, Total elements extracted: {total_elements_processed}")
     return final_output
 
 def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Dict[str, Any]:
@@ -512,7 +520,8 @@ def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Di
     # Extract tables if detected
     if content_analysis['summary']['has_tables']:
         print("\n🔍 Extracting tables with specialized table extractor...")
-        logger.info("Extracting tables with specialized extractor")
+        table_pages_count = len(content_analysis['summary']['table_pages'])
+        logger.info(f"Extracting tables with specialized extractor from {table_pages_count} pages")
         try:
             from extractors.table_extractor import extract_tables_with_cv, extract_tables_to_excel
 
@@ -525,7 +534,8 @@ def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Di
                     'pages': content_analysis['summary']['table_pages']
                 }
                 print(f"    ✓ Tables extracted to Excel: {excel_output}")
-                logger.info(f"Tables extracted to Excel: {excel_output}")
+                extraction_rate = (len(content_analysis['summary']['table_pages']) / content_analysis['total_pages'] * 100) if content_analysis['total_pages'] > 0 else 0
+                logger.info(f"Tables extracted to Excel: {excel_output} ({extraction_rate:.1f}% of total pages had tables)")
             else:
                 # JSON extraction for tables
                 tables_json = extract_tables_with_cv(pdf_path)
@@ -535,7 +545,8 @@ def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Di
                     'pages': content_analysis['summary']['table_pages']
                 }
                 print(f"    ✓ Tables extracted to JSON format")
-                logger.info("Tables extracted to JSON format")
+                extraction_rate = (len(content_analysis['summary']['table_pages']) / content_analysis['total_pages'] * 100) if content_analysis['total_pages'] > 0 else 0
+                logger.info(f"Tables extracted to JSON format ({extraction_rate:.1f}% of total pages had tables)")
         except Exception as e:
             logger.error(f"Table extraction failed: {e}", exc_info=True)
             print(f"    ❌ Table extraction failed: {e}")
@@ -553,7 +564,8 @@ def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Di
                 'count': sum(len(imgs) for imgs in images.values())
             }
             print(f"    ✓ {result['images']['count']} images extracted")
-            logger.info(f"Extracted {result['images']['count']} images from {len(result['images']['pages'])} pages")
+            extraction_rate = (len(result['images']['pages']) / content_analysis['total_pages'] * 100) if content_analysis['total_pages'] > 0 else 0
+            logger.info(f"Extracted {result['images']['count']} images from {len(result['images']['pages'])} pages ({extraction_rate:.1f}% of total pages had images)")
         except Exception as e:
             logger.error(f"Image extraction failed: {e}", exc_info=True)
             print(f"    ❌ Image extraction failed: {e}")
@@ -571,7 +583,8 @@ def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Di
                 'paragraphs': sum(len(texts) for texts in text_content.values())
             }
             print(f"    ✓ {result['text']['paragraphs']} text blocks extracted")
-            logger.info(f"Extracted {result['text']['paragraphs']} text blocks from {len(result['text']['pages'])} pages")
+            extraction_rate = (len(result['text']['pages']) / content_analysis['total_pages'] * 100) if content_analysis['total_pages'] > 0 else 0
+            logger.info(f"Extracted {result['text']['paragraphs']} text blocks from {len(result['text']['pages'])} pages ({extraction_rate:.1f}% of total pages had text)")
         except Exception as e:
             logger.error(f"Text extraction failed: {e}", exc_info=True)
             print(f"    ❌ Text extraction failed: {e}")
@@ -582,9 +595,21 @@ def intelligent_pdf_extraction(pdf_path: str, output_format: str = 'json') -> Di
         print("\n🔄 Combining all content with layout preservation...")
         result['combined_output'] = get_document_layout(pdf_path, use_opencv_analysis=False)
 
-    logger.info("Intelligent PDF extraction completed successfully")
+    # Calculate overall extraction success rate
+    total_detected_elements = 0
+    total_pages_with_content = 0
+    if content_analysis['summary']['has_tables']:
+        total_pages_with_content += len(content_analysis['summary']['table_pages'])
+    if content_analysis['summary']['has_images']:
+        total_pages_with_content += len(content_analysis['summary']['image_pages'])
+    if content_analysis['summary']['has_text']:
+        total_pages_with_content += len(content_analysis['summary']['text_pages'])
+
+    overall_extraction_rate = (total_pages_with_content / (content_analysis['total_pages'] * 3) * 100) if content_analysis['total_pages'] > 0 else 0
+
+    logger.info(f"Intelligent PDF extraction completed successfully. Overall extraction efficiency: {overall_extraction_rate:.1f}%")
     print("\n" + "=" * 60)
-    print("✅ Intelligent extraction completed!")
+    print(f"✅ Intelligent extraction completed! (Efficiency: {overall_extraction_rate:.1f}%)")
     print("=" * 60)
 
     return result
